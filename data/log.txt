@@ -1,0 +1,20 @@
+
+========================================
+  GridAdvisor - Data Collection
+========================================
+
+GPU: NVIDIA GeForce RTX 4070
+SM Count: 46
+Memory Bandwidth: 504.048 GB/s
+
+Running transpose...
+Running reduction...
+Running matmul_naive...
+Running matmul_shared...
+Running stencil_2d...
+
+========================================
+✓ Data collection completed!
+✓ Total measurements: 18
+========================================
+

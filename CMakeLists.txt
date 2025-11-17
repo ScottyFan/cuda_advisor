@@ -63,3 +63,9 @@ add_executable(gridadvisor
     src/gridadvisor.cu
 )
 target_link_libraries(gridadvisor device_query benchmarks)
+
+# Data collection tool
+add_executable(collect_data
+    src/collect_data.cu
+)
+target_link_libraries(collect_data device_query benchmarks)
