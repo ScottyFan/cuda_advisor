@@ -3,7 +3,7 @@
 GridAdvisor Data Analysis Script
 Analyzes profiling results and generates accuracy metrics
 """
-
+import argparse
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -113,13 +113,35 @@ def plot_results(df, best_configs, accuracy_df, output_dir):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
+    kernels = df['kernel_name'].unique()
+    num_kernels = len(kernels)
+    
+    # 动态计算网格大小
+    if num_kernels <= 6:
+        rows, cols = 2, 3
+    elif num_kernels <= 9:
+        rows, cols = 3, 3
+    else:
+        rows, cols = 4, 3
+    
     # Plot 1: Performance vs Thread Count for each kernel
-    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    fig, axes = plt.subplots(rows, cols, figsize=(5*cols, 5*rows))
     fig.suptitle('Execution Time vs Thread Count', fontsize=16)
     
-    kernels = df['kernel_name'].unique()
-    for idx, kernel in enumerate(kernels[:6]):  # Plot first 6
-        ax = axes[idx // 3, idx % 3]
+    # 如果只有一行或一列，axes不是2D数组
+    if rows == 1:
+        axes = axes.reshape(1, -1)
+    if cols == 1:
+        axes = axes.reshape(-1, 1)
+    
+    for idx, kernel in enumerate(kernels):
+        if idx >= rows * cols:
+            break
+            
+        row = idx // cols
+        col = idx % cols
+        ax = axes[row, col]
+        
         kernel_data = df[df['kernel_name'] == kernel]
         
         ax.plot(kernel_data['threads_per_block'], kernel_data['time_ms'], 
@@ -142,6 +164,12 @@ def plot_results(df, best_configs, accuracy_df, output_dir):
         ax.set_title(kernel)
         ax.legend()
         ax.grid(True, alpha=0.3)
+    
+    # 隐藏多余的子图
+    for idx in range(num_kernels, rows * cols):
+        row = idx // cols
+        col = idx % cols
+        axes[row, col].axis('off')
     
     plt.tight_layout()
     plt.savefig(output_dir / 'performance_curves.png', dpi=150, bbox_inches='tight')
@@ -220,9 +248,24 @@ def save_report(summary, accuracy_df, output_dir):
     print(f"✓ Saved: {report_file}")
 
 def main():
-    csv_file = 'data/profiling_results.csv'
-    output_dir = 'data/analysis'
+    parser = argparse.ArgumentParser(description='Analyze GridAdvisor profiling results')
+    parser.add_argument('--input', '-i', 
+                       default='data/profiling_results.csv',
+                       help='Input CSV file (default: data/profiling_results.csv)')
+    parser.add_argument('--output', '-o',
+                       default='data/analysis',
+                       help='Output directory (default: data/analysis)')
+    args = parser.parse_args()
     
+    csv_file = args.input
+    output_dir = args.output
+    
+    print("\n" + "="*60)
+    print("GridAdvisor - Data Analysis")
+    print("="*60 + "\n")
+    print(f"Input file: {csv_file}")
+    print(f"Output dir: {output_dir}\n")
+
     print("\n" + "="*60)
     print("GridAdvisor - Data Analysis")
     print("="*60 + "\n")

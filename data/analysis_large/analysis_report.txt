@@ -1,0 +1,19 @@
+============================================================
+GridAdvisor - Analysis Report
+============================================================
+
+Overall Accuracy: 50.0%
+Mean Error: ±204 threads
+Median Error: ±112 threads
+
+------------------------------------------------------------
+Per-Kernel Results:
+------------------------------------------------------------
+transpose            Pred: 512 Actual: 256 [WRONG]
+reduction            Pred: 128 Actual: 128 [CORRECT]
+matmul_naive         Pred:  64 Actual:  64 [CORRECT]
+stencil_2d           Pred: 256 Actual: 256 [CORRECT]
+mandelbrot           Pred: 256 Actual: 512 [WRONG]
+histogram            Pred: 128 Actual: 128 [CORRECT]
+scatter              Pred:  32 Actual: 256 [WRONG]
+prefix_sum           Pred: 128 Actual:1024 [WRONG]

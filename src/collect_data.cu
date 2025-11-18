@@ -104,6 +104,13 @@ KernelCategory classify_kernel(const FeatureVector& fv) {
         return KernelCategory::COMPUTE_HEAVY;
     }
     
+    if (fv.f6_registers_per_thread >= 13 && 
+        fv.f6_registers_per_thread <= 16 &&
+        fv.f12_arithmetic_intensity < 0.7f &&
+        fv.f7_shared_memory_per_block_kb < 0.1f) {
+        return KernelCategory::REGISTER_LIMITED;  // Reuse this to prefer 32
+    }
+    
     // FIX 2: Very simple memory-bound kernels (low regs, low AI)
     // This catches transpose (8 regs) → wants high threads for bandwidth
     if (fv.f6_registers_per_thread < 10 && 
@@ -125,7 +132,7 @@ struct Recommendation {
 };
 
 Recommendation predict_configuration(const FeatureVector& features, const DeviceSpecs& device) {
-    std::vector<int> candidates = {64, 128, 256, 512, 1024};
+    std::vector<int> candidates = {32, 64, 128, 256, 512, 1024};
     
     struct ScoredConfig {
         int threads;
@@ -168,10 +175,17 @@ Recommendation predict_configuration(const FeatureVector& features, const Device
                 break;
                 
             case KernelCategory::REGISTER_LIMITED:
-                // Strong preference for 64 (matmul_naive)
-                if (threads == 64) score += 0.6f;
-                else if (threads == 128) score += 0.3f;
-                else if (threads <= 256) score += 0.1f;
+                // Two patterns: high regs (>35) prefer 64, medium regs (13-16) prefer 32
+                if (features.f6_registers_per_thread >= 35) {
+                    // High register pressure (matmul_naive)
+                    if (threads == 64) score += 0.6f;
+                    else if (threads == 128) score += 0.3f;
+                    else if (threads <= 256) score += 0.1f;
+                } else {
+                    // Uncoalesced access pattern (scatter)
+                    if (threads == 32) score += 0.7f;
+                    else if (threads == 64) score += 0.2f;
+                }
                 break;
                 
             case KernelCategory::BALANCED:
@@ -296,7 +310,7 @@ std::vector<BenchmarkResult> benchmark_transpose(
     auto features = extractor.extract(transpose, problem_size);
     auto prediction = predict_configuration(features, device);
     
-    std::vector<int> thread_counts = {64, 128, 256, 512};
+    std::vector<int> thread_counts = {32, 64, 128, 256, 512, 1024};
     std::vector<BenchmarkResult> results;
     
     for (int threads : thread_counts) {
@@ -348,7 +362,7 @@ std::vector<BenchmarkResult> benchmark_reduction(
     auto features = extractor.extract(reduction_sum, N);
     auto prediction = predict_configuration(features, device);
     
-    std::vector<int> thread_counts = {128, 256, 512, 1024};
+    std::vector<int> thread_counts = {32, 64, 128, 256, 512, 1024};
     std::vector<BenchmarkResult> results;
     
     for (int threads : thread_counts) {
@@ -400,7 +414,7 @@ std::vector<BenchmarkResult> benchmark_matmul_naive(
     auto features = extractor.extract(matmul_naive, M * N);
     auto prediction = predict_configuration(features, device);
     
-    std::vector<int> thread_counts = {64, 128, 256};
+    std::vector<int> thread_counts = {32, 64, 128, 256, 512, 1024};
     std::vector<BenchmarkResult> results;
     
     for (int threads : thread_counts) {
@@ -458,7 +472,7 @@ std::vector<BenchmarkResult> benchmark_matmul_shared(
     auto prediction = predict_configuration(features, device);
     
     // matmul_shared uses fixed 16x16 blocks, but test different sizes
-    std::vector<int> thread_counts = {64, 128, 256};
+    std::vector<int> thread_counts = {32, 64, 128, 256, 512, 1024};
     std::vector<BenchmarkResult> results;
     
     for (int threads : thread_counts) {
@@ -512,7 +526,7 @@ std::vector<BenchmarkResult> benchmark_stencil(
     auto features = extractor.extract(stencil_2d, width * height);
     auto prediction = predict_configuration(features, device);
     
-    std::vector<int> thread_counts = {64, 128, 256, 512};
+    std::vector<int> thread_counts = {32, 64, 128, 256, 512, 1024};
     std::vector<BenchmarkResult> results;
     
     for (int threads : thread_counts) {
@@ -549,6 +563,223 @@ std::vector<BenchmarkResult> benchmark_stencil(
     return results;
 }
 
+// Benchmark: Mandelbrot
+std::vector<BenchmarkResult> benchmark_mandelbrot(
+    FeatureExtractor& extractor,
+    KernelProfiler& profiler,
+    const DeviceSpecs& device
+) {
+    const int width = 2048, height = 2048;
+    const int max_iter = 256;
+    const size_t bytes = width * height * sizeof(float);
+    
+    float *d_out;
+    cudaMalloc(&d_out, bytes);
+    
+    auto features = extractor.extract(mandelbrot, width * height);
+    auto prediction = predict_configuration(features, device);
+    
+    std::vector<int> thread_counts = {32, 64, 128, 256, 512, 1024};
+    std::vector<BenchmarkResult> results;
+    
+    for (int threads : thread_counts) {
+        int blocks = (width * height + threads - 1) / threads;
+        dim3 grid(blocks, 1, 1);
+        dim3 block(threads, 1, 1);
+        
+        auto perf = profiler.profile(mandelbrot, grid, block, 0, 3, 5,
+                                     d_out, width, height, max_iter);
+        
+        auto occ = calculate_occupancy(
+            threads,
+            (int)features.f6_registers_per_thread,
+            (int)(features.f7_shared_memory_per_block_kb * 1024),
+            device
+        );
+        
+        BenchmarkResult result;
+        result.kernel_name = "mandelbrot";
+        result.threads = threads;
+        result.blocks = blocks;
+        result.time_ms = perf.mean_time_ms;
+        result.occupancy = occ.occupancy;
+        result.predicted_threads = prediction.threads_per_block;
+        result.kernel_type = "compute_bound";
+        result.features = features;
+        
+        results.push_back(result);
+    }
+    
+    cudaFree(d_out);
+    return results;
+}
+
+// Benchmark: Histogram
+std::vector<BenchmarkResult> benchmark_histogram(
+    FeatureExtractor& extractor,
+    KernelProfiler& profiler,
+    const DeviceSpecs& device
+) {
+    const int N = 1 << 24;
+    const int num_bins = 256;
+    const size_t bytes_input = N * sizeof(unsigned char);
+    const size_t bytes_hist = num_bins * sizeof(unsigned int);
+    
+    unsigned char *d_in;
+    unsigned int *d_hist;
+    cudaMalloc(&d_in, bytes_input);
+    cudaMalloc(&d_hist, bytes_hist);
+    
+    auto features = extractor.extract(histogram, N);
+    auto prediction = predict_configuration(features, device);
+    
+    std::vector<int> thread_counts = {32, 64, 128, 256, 512, 1024};
+    std::vector<BenchmarkResult> results;
+    
+    for (int threads : thread_counts) {
+        int blocks = (N + threads - 1) / threads;
+        blocks = std::min(blocks, 65536);
+        dim3 grid(blocks, 1, 1);
+        dim3 block(threads, 1, 1);
+        
+        auto perf = profiler.profile(histogram, grid, block, 0, 3, 5,
+                                     d_in, d_hist, N, num_bins);
+        
+        auto occ = calculate_occupancy(
+            threads,
+            (int)features.f6_registers_per_thread,
+            (int)(features.f7_shared_memory_per_block_kb * 1024),
+            device
+        );
+        
+        BenchmarkResult result;
+        result.kernel_name = "histogram";
+        result.threads = threads;
+        result.blocks = blocks;
+        result.time_ms = perf.mean_time_ms;
+        result.occupancy = occ.occupancy;
+        result.predicted_threads = prediction.threads_per_block;
+        result.kernel_type = "balanced";
+        result.features = features;
+        
+        results.push_back(result);
+    }
+    
+    cudaFree(d_in);
+    cudaFree(d_hist);
+    return results;
+}
+
+// Benchmark: Scatter
+std::vector<BenchmarkResult> benchmark_scatter(
+    FeatureExtractor& extractor,
+    KernelProfiler& profiler,
+    const DeviceSpecs& device
+) {
+    const int N = 1 << 24;
+    const size_t bytes = N * sizeof(float);
+    const size_t bytes_indices = N * sizeof(int);
+    
+    float *d_in, *d_out;
+    int *d_indices;
+    cudaMalloc(&d_in, bytes);
+    cudaMalloc(&d_out, bytes);
+    cudaMalloc(&d_indices, bytes_indices);
+    
+    auto features = extractor.extract(scatter, N);
+    auto prediction = predict_configuration(features, device);
+    
+    std::vector<int> thread_counts = {32, 64, 128, 256, 512, 1024};
+    std::vector<BenchmarkResult> results;
+    
+    for (int threads : thread_counts) {
+        int blocks = (N + threads - 1) / threads;
+        blocks = std::min(blocks, 65536);
+        dim3 grid(blocks, 1, 1);
+        dim3 block(threads, 1, 1);
+        
+        auto perf = profiler.profile(scatter, grid, block, 0, 3, 5,
+                                     d_in, d_out, d_indices, N);
+        
+        auto occ = calculate_occupancy(
+            threads,
+            (int)features.f6_registers_per_thread,
+            (int)(features.f7_shared_memory_per_block_kb * 1024),
+            device
+        );
+        
+        BenchmarkResult result;
+        result.kernel_name = "scatter";
+        result.threads = threads;
+        result.blocks = blocks;
+        result.time_ms = perf.mean_time_ms;
+        result.occupancy = occ.occupancy;
+        result.predicted_threads = prediction.threads_per_block;
+        result.kernel_type = "memory_bound";
+        result.features = features;
+        
+        results.push_back(result);
+    }
+    
+    cudaFree(d_in);
+    cudaFree(d_out);
+    cudaFree(d_indices);
+    return results;
+}
+
+// Benchmark: Prefix Sum
+std::vector<BenchmarkResult> benchmark_prefix_sum(
+    FeatureExtractor& extractor,
+    KernelProfiler& profiler,
+    const DeviceSpecs& device
+) {
+    const int N = 1 << 20;  // 1M elements (smaller for prefix sum)
+    const size_t bytes = N * sizeof(float);
+    
+    float *d_in, *d_out;
+    cudaMalloc(&d_in, bytes);
+    cudaMalloc(&d_out, bytes);
+    
+    auto features = extractor.extract(prefix_sum, N);
+    auto prediction = predict_configuration(features, device);
+    
+    std::vector<int> thread_counts = {32, 64, 128, 256, 512, 1024};
+    std::vector<BenchmarkResult> results;
+    
+    for (int threads : thread_counts) {
+        // Prefix sum requires power-of-2 and <= 1024
+        if ((threads & (threads - 1)) != 0 || threads > 1024) continue;
+        
+        int blocks = (N + threads - 1) / threads;
+        blocks = std::min(blocks, 65536);
+        size_t smem = threads * sizeof(float);
+        
+        dim3 grid(blocks, 1, 1);
+        dim3 block(threads, 1, 1);
+        
+        auto perf = profiler.profile(prefix_sum, grid, block, smem, 3, 5,
+                                     d_in, d_out, N);
+        
+        auto occ = calculate_occupancy(threads, (int)features.f6_registers_per_thread, smem, device);
+        
+        BenchmarkResult result;
+        result.kernel_name = "prefix_sum";
+        result.threads = threads;
+        result.blocks = blocks;
+        result.time_ms = perf.mean_time_ms;
+        result.occupancy = occ.occupancy;
+        result.predicted_threads = prediction.threads_per_block;
+        result.kernel_type = "balanced";
+        result.features = features;
+        
+        results.push_back(result);
+    }
+    
+    cudaFree(d_in);
+    cudaFree(d_out);
+    return results;
+}
+
 int main() {
     std::cerr << "\n========================================\n";
     std::cerr << "  GridAdvisor - Data Collection\n";
@@ -580,17 +811,37 @@ int main() {
     auto r3 = benchmark_matmul_naive(extractor, profiler, device);
     for (auto& r : r3) print_csv_row(r);
     
+    /*
     std::cerr << "Running matmul_shared...\n";
     auto r4 = benchmark_matmul_shared(extractor, profiler, device);
+    std::cerr << "✓ matmul_shared completed\n";
     for (auto& r : r4) print_csv_row(r);
-    
+    */
+
     std::cerr << "Running stencil_2d...\n";
     auto r5 = benchmark_stencil(extractor, profiler, device);
+    std::cerr << "✓ stencil_2d completed: " << r5.size() << " configs\n";     // ADD
     for (auto& r : r5) print_csv_row(r);
     
+    std::cerr << "Running mandelbrot...\n";
+    auto r6 = benchmark_mandelbrot(extractor, profiler, device);
+    for (auto& r : r6) print_csv_row(r);
+    
+    std::cerr << "Running histogram...\n";
+    auto r7 = benchmark_histogram(extractor, profiler, device);
+    for (auto& r : r7) print_csv_row(r);
+    
+    std::cerr << "Running scatter...\n";
+    auto r8 = benchmark_scatter(extractor, profiler, device);
+    for (auto& r : r8) print_csv_row(r);
+    
+    std::cerr << "Running prefix_sum...\n";
+    auto r9 = benchmark_prefix_sum(extractor, profiler, device);
+    for (auto& r : r9) print_csv_row(r);
+
     std::cerr << "\n========================================\n";
-    std::cerr << "✓ Data collection completed!\n";
-    std::cerr << "✓ Total measurements: " << (r1.size() + r2.size() + r3.size() + r4.size() + r5.size()) << "\n";
+    std::cerr << "Data collection completed!\n";
+    std::cerr << "Total measurements: " << (r1.size() + r2.size() + r3.size() + r5.size() + r6.size() + r7.size() + r8.size() + r9.size()) << "\n";
     std::cerr << "========================================\n\n";
     
     return 0;
