@@ -132,120 +132,164 @@ struct Recommendation {
 };
 
 Recommendation predict_configuration(const FeatureVector& features, const DeviceSpecs& device) {
+    // Extract key features
+    float regs = features.f6_registers_per_thread;
+    float smem_kb = features.f7_shared_memory_per_block_kb;
+    float ai = features.f12_arithmetic_intensity;
+    float work_per_sm = features.f24_work_per_sm;
+    float problem_size = features.f23_total_work_items;
+    
+    // Candidate thread counts
     std::vector<int> candidates = {32, 64, 128, 256, 512, 1024};
     
     struct ScoredConfig {
         int threads;
         float score;
         float occupancy;
+        std::string reason;
     };
     
     std::vector<ScoredConfig> scored;
-    KernelCategory category = classify_kernel(features);
     
+    // ========== Phase 1: Roofline Analysis ==========
+    // Determine if kernel is compute-bound or memory-bound
+    bool is_compute_bound = (ai > 1.0);
+    bool is_memory_bound = (ai < 0.6);
+    bool has_high_reg_pressure = (regs > 35);
+    
+    // ========== Phase 2: Evaluate Each Candidate ==========
     for (int threads : candidates) {
+        ScoredConfig config;
+        config.threads = threads;
+        config.score = 0.0f;
+        
+        // Calculate occupancy for this configuration
         auto occ = calculate_occupancy(
             threads,
-            (int)features.f6_registers_per_thread,
-            (int)(features.f7_shared_memory_per_block_kb * 1024),
+            (int)regs,
+            (int)(smem_kb * 1024),
             device
         );
+        config.occupancy = occ.occupancy;
         
-        float score = occ.occupancy * 0.3f;
+        // --- Component 1: Occupancy Score (0-40 points) ---
+        float occ_score = config.occupancy * 40.0f;
         
-        // Category-specific preferences
-        switch (category) {
-            case KernelCategory::MEMORY_BANDWIDTH_LIMITED:
-                // FIX 2: Prefer 512 for simple memory-bound (transpose)
-                if (threads == 512) score += 0.45f;
-                else if (threads >= 256) score += 0.35f;
-                else if (threads >= 128) score += 0.15f;
-                break;
-                
-            case KernelCategory::COMPUTE_HEAVY:
-                score += occ.occupancy * 0.4f;
-                if (threads >= 256) score += 0.2f;
-                break;
-                
-            case KernelCategory::SHARED_MEMORY_BOUND:
-                // Prefer 128 for shared memory (reduction, matmul_shared)
-                if (threads == 128) score += 0.5f;
-                else if (threads == 256) score += 0.2f;
-                else if (threads == 64) score += 0.1f;
-                break;
-                
-            case KernelCategory::REGISTER_LIMITED:
-                // Two patterns: high regs (>35) prefer 64, medium regs (13-16) prefer 32
-                if (features.f6_registers_per_thread >= 35) {
-                    // High register pressure (matmul_naive)
-                    if (threads == 64) score += 0.6f;
-                    else if (threads == 128) score += 0.3f;
-                    else if (threads <= 256) score += 0.1f;
-                } else {
-                    // Uncoalesced access pattern (scatter)
-                    if (threads == 32) score += 0.7f;
-                    else if (threads == 64) score += 0.2f;
-                }
-                break;
-                
-            case KernelCategory::BALANCED:
-                // FIX 3: Prefer 256 for balanced (stencil)
-                if (threads == 256) score += 0.40f;
-                else if (threads == 512) score += 0.30f;
-                else if (threads == 128) score += 0.25f;
-                break;
+        // --- Component 2: Resource Efficiency (0-30 points) ---
+        float resource_score = 0.0f;
+        
+        // High register pressure penalty
+        if (has_high_reg_pressure) {
+            if (threads <= 128) {
+                resource_score = 30.0f;  // Good - low thread count
+            } else {
+                resource_score = 10.0f * (1024.0f - threads) / 1024.0f;  // Penalty for high threads
+            }
+        } else {
+            resource_score = 20.0f;  // Neutral
         }
         
-        // Secondary factors
-        int warps = threads / 32;
-        if (warps >= 4) score += 0.12f;
-        else if (warps >= 2) score += 0.06f;
+        // --- Component 3: Workload Matching (0-30 points) ---
+        float workload_score = 0.0f;
         
-        // Warp scheduling (non-overlapping)
-        if (warps >= 12) score += 0.10f;
-        else if (warps >= 8) score += 0.08f;
-        else if (warps >= 4) score += 0.05f;
-        
-        // Power-of-2
-        if ((threads & (threads - 1)) == 0) score += 0.05f;
-        
-        // Register pressure penalty
-        int total_regs = threads * (int)features.f6_registers_per_thread;
-        if (total_regs > device.regs_per_block * 0.8f) {
-            score *= 0.7f;
+        if (is_compute_bound) {
+            // Compute-bound: need high occupancy for latency hiding
+            if (config.occupancy > 0.5f && threads >= 256) {
+                workload_score = 30.0f;
+            } else {
+                workload_score = config.occupancy * 20.0f;
+            }
+        } else if (is_memory_bound) {
+            // Memory-bound: need high thread count for bandwidth
+            float bandwidth_util = std::min(threads / 512.0f, 1.0f);
+            workload_score = bandwidth_util * 30.0f;
+        } else {
+            // Balanced: prefer middle ground
+            if (threads >= 128 && threads <= 512) {
+                workload_score = 30.0f;
+            } else {
+                workload_score = 15.0f;
+            }
         }
         
-        scored.push_back({threads, score, occ.occupancy});
+        // --- Component 4: Problem Size Adaptation (0-20 points) ---
+        float size_score = 0.0f;
+        
+        // Small problems: prefer high occupancy
+        if (work_per_sm < 10000) {
+            size_score = (threads >= 512) ? 20.0f : 10.0f;
+        }
+        // Large problems: consider bandwidth needs
+        else if (work_per_sm > 100000) {
+            if (is_memory_bound && threads >= 256) {
+                size_score = 20.0f;
+            } else if (is_compute_bound && threads >= 512) {
+                size_score = 20.0f;
+            } else {
+                size_score = 10.0f;
+            }
+        }
+        // Medium problems: balanced approach
+        else {
+            if (threads >= 128 && threads <= 512) {
+                size_score = 20.0f;
+            } else {
+                size_score = 10.0f;
+            }
+        }
+        
+        // --- Component 5: Warp Efficiency (0-10 points) ---
+        int num_warps = (threads + 31) / 32;
+        float warp_score = 0.0f;
+        
+        // Prefer configurations with good warp scheduling
+        if (num_warps >= 4 && num_warps <= 16) {
+            warp_score = 10.0f;
+        } else if (num_warps >= 2) {
+            warp_score = 5.0f;
+        }
+        
+        // --- Bonus: Power-of-2 threads ---
+        if ((threads & (threads - 1)) == 0) {
+            config.score += 5.0f;
+        }
+        
+        // --- Total Score ---
+        config.score = occ_score + resource_score + workload_score + 
+                      size_score + warp_score;
+        
+        // --- Penalty: Very low occupancy ---
+        if (config.occupancy < 0.2f) {
+            config.score *= 0.5f;
+        }
+        
+        // Build reasoning string
+        if (has_high_reg_pressure) {
+            config.reason = "High_reg_pressure";
+        } else if (is_compute_bound) {
+            config.reason = "Compute_bound";
+        } else if (is_memory_bound) {
+            config.reason = "Memory_bound";
+        } else {
+            config.reason = "Balanced";
+        }
+        
+        scored.push_back(config);
     }
     
+    // ========== Phase 3: Select Best Configuration ==========
     auto best = std::max_element(scored.begin(), scored.end(),
         [](const ScoredConfig& a, const ScoredConfig& b) {
             return a.score < b.score;
         });
     
+    // Build recommendation
     Recommendation rec;
     rec.threads_per_block = best->threads;
-    rec.num_blocks = ((int)features.f23_total_work_items + best->threads - 1) / best->threads;
+    rec.num_blocks = ((int)problem_size + best->threads - 1) / best->threads;
     rec.predicted_occupancy = best->occupancy;
-    rec.confidence = best->score;
-    
-    switch (category) {
-        case KernelCategory::MEMORY_BANDWIDTH_LIMITED:
-            rec.reasoning = "Memory_bandwidth";
-            break;
-        case KernelCategory::COMPUTE_HEAVY:
-            rec.reasoning = "Compute_heavy";
-            break;
-        case KernelCategory::SHARED_MEMORY_BOUND:
-            rec.reasoning = "Shared_memory";
-            break;
-        case KernelCategory::REGISTER_LIMITED:
-            rec.reasoning = "Register_limited";
-            break;
-        case KernelCategory::BALANCED:
-            rec.reasoning = "Balanced";
-            break;
-    }
+    rec.confidence = best->score / 100.0f;  // Normalize to 0-1
+    rec.reasoning = best->reason;
     
     return rec;
 }
@@ -307,7 +351,11 @@ std::vector<BenchmarkResult> benchmark_transpose(
     cudaMalloc(&d_out, bytes);
     
     // Extract features once
-    auto features = extractor.extract(transpose, problem_size);
+    auto features = extractor.extract_with_profiling(
+        transpose, 
+        problem_size,
+        d_in, d_out, N, N  // 实际kernel参数
+    );
     auto prediction = predict_configuration(features, device);
     
     std::vector<int> thread_counts = {32, 64, 128, 256, 512, 1024};
